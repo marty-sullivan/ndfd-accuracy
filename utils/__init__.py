@@ -1,12 +1,14 @@
 import logging
+import pandas
 import re 
+import shapefile
 import subprocess
 import yaml
-import pandas
 from boto3.session import Session
 from botocore.exceptions import ClientError, WaiterError
 from datetime import datetime, timedelta
 from os import path, remove
+from pyproj import Proj
 from sys import stdout
 from troposphere.template_generator import TemplateGenerator
 
@@ -49,11 +51,27 @@ class GoUtils:
         logging.getLogger('botocore').propagate = False
 
     def parse_stations(self):
-        colspec = [(0, 10), (12, 19), (21, 29), (31, 36), (38, 39), (41, 70), (72, 74), (76, 78), (80, 84)]
-        names = ['id', 'lat', 'lon', 'ele', 'st', 'name', 'gsn', 'hcncrn', 'wmo']
+        colspec = [(0, 11), (12, 20), (21, 30), (31, 37), (38, 40), (41, 71), (72, 75), (76, 79), (80, 85)]
+        names = ['id', 'lat', 'lon', 'elev', 'st', 'name', 'gsn', 'hcncrn', 'wmo']
 
         data = pandas.read_fwf('ghcnd-stations.txt', colspecs=colspec, names=names)
+        p = Proj('+proj=utm +zone=18T, +north +ellps=WGS84 +datum=WGS84 +units=m +no_defs')
 
+        w = shapefile.Writer(shapeType=shapefile.POINTZ)
+        w.field('stationId', 'C', size=11)
+        w.field('stationName', 'C', size=30)
+        w.field('lat', 'N', decimal=4)
+        w.field('lon', 'N', decimal=4)
+        w.field('elev', 'N', decimal=1)
+
+        count = 0
         for i, row in data.iterrows():
-            print(row['id'])
+            if row['st'] == 'NY':
+                count += 1
+                x, y = p(row['lon'], row['lat'])
+                w.point(x, y, row['elev'])
+                w.record(row['id'], row['name'], row['lat'], row['lon'], row['elev'])
+
+        self.logger.info('{Count} stations in NYS.'.format(Count=count))
+        w.save('./shapefiles/ny.shp')
             
