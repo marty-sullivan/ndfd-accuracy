@@ -1,3 +1,4 @@
+import csv
 import logging
 import pandas
 import re 
@@ -57,21 +58,24 @@ class GoUtils:
         data = pandas.read_fwf('ghcnd-stations.txt', colspecs=colspec, names=names)
         p = Proj('+proj=utm +zone=18T, +north +ellps=WGS84 +datum=WGS84 +units=m +no_defs')
 
-        w = shapefile.Writer(shapeType=shapefile.POINTZ)
-        w.field('stationId', 'C', size=11)
-        w.field('stationName', 'C', size=30)
-        w.field('lat', 'N', decimal=4)
-        w.field('lon', 'N', decimal=4)
-        w.field('elev', 'N', decimal=1)
+        pointz = shapefile.Writer(shapeType=shapefile.POINTZ)
+        pointz.field('stationId', 'C', size=11)
+        pointz.field('stationName', 'C', size=30)
+        pointz.field('lat', 'N', decimal=4)
+        pointz.field('lon', 'N', decimal=4)
+        pointz.field('elev', 'N', decimal=1)
 
         count = 0
-        for i, row in data.iterrows():
-            if row['st'] == 'NY':
-                count += 1
-                x, y = p(row['lon'], row['lat'])
-                w.point(x, y, row['elev'])
-                w.record(row['id'], row['name'], row['lat'], row['lon'], row['elev'])
+        with open('./output/ny_points.csv', 'wb') as csvfile:
+            csvwriter = csv.writer(csvfile)
+            for i, row in data.iterrows():
+                if row['st'] == 'NY' and 'AP' in row['name']:
+                    count += 1
+                    csvwriter.writerow(row.tolist())
+                    x, y = p(row['lon'], row['lat'])
+                    pointz.point(x, y, row['elev'])
+                    pointz.record(row['id'], row['name'], row['lat'], row['lon'], row['elev'])
 
-        self.logger.info('{Count} stations in NYS.'.format(Count=count))
-        w.save('./shapefiles/ny.shp')
+        self.logger.info('{Count} Airport stations in NYS.'.format(Count=count))
+        pointz.save('./output/ny_points')
             
