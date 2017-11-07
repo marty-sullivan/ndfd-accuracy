@@ -13,4 +13,6 @@ parser.add_argument('--log_level', type=str, default='INFO', help='Log Level for
 args = parser.parse_args()
 utils = GoUtils(args)
 
-utils.parse_stations()
+stations = utils.parse_stations()
+utils.retrieve_observations(stations, ['2015', '2016', '2017'])
+

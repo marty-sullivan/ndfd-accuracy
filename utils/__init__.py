@@ -1,17 +1,17 @@
 import csv
+import gzip
 import logging
-import pandas
-import re 
 import shapefile
 import subprocess
 import yaml
 from boto3.session import Session
 from botocore.exceptions import ClientError, WaiterError
 from datetime import datetime, timedelta
+from glob import glob
 from os import path, remove
 from pyproj import Proj
 from sys import stdout
-from troposphere.template_generator import TemplateGenerator
+from urllib2 import urlopen
 
 class GoUtils:
 
@@ -52,30 +52,69 @@ class GoUtils:
         logging.getLogger('botocore').propagate = False
 
     def parse_stations(self):
-        colspec = [(0, 11), (12, 20), (21, 30), (31, 37), (38, 40), (41, 71), (72, 75), (76, 79), (80, 85)]
-        names = ['id', 'lat', 'lon', 'elev', 'st', 'name', 'gsn', 'hcncrn', 'wmo']
+        with open('./isd-history.csv', 'rb') as csvHistory:
+            stations = csv.DictReader(csvHistory)
+            startTime = datetime.strptime('20151001', '%Y%m%d')
+            endTime = datetime.strptime('20171031', '%Y%m%d')
 
-        data = pandas.read_fwf('ghcnd-stations.txt', colspecs=colspec, names=names)
-        p = Proj('+proj=utm +zone=18T, +north +ellps=WGS84 +datum=WGS84 +units=m +no_defs')
-
-        pointz = shapefile.Writer(shapeType=shapefile.POINTZ)
-        pointz.field('stationId', 'C', size=11)
-        pointz.field('stationName', 'C', size=30)
-        pointz.field('lat', 'N', decimal=4)
-        pointz.field('lon', 'N', decimal=4)
-        pointz.field('elev', 'N', decimal=1)
-
-        count = 0
-        with open('./output/ny_points.csv', 'wb') as csvfile:
-            csvwriter = csv.writer(csvfile)
-            for i, row in data.iterrows():
-                if row['st'] == 'NY' and 'AP' in row['name']:
-                    count += 1
-                    csvwriter.writerow(row.tolist())
-                    x, y = p(row['lon'], row['lat'])
-                    pointz.point(x, y, row['elev'])
-                    pointz.record(row['id'], row['name'], row['lat'], row['lon'], row['elev'])
-
-        self.logger.info('{Count} Airport stations in NYS.'.format(Count=count))
-        pointz.save('./output/ny_points')
+            p = Proj('+proj=utm +zone=18T, +north +ellps=WGS84 +datum=WGS84 +units=m +no_defs')
+            w = shapefile.Writer(shapeType=shapefile.POINTZ)
             
+            w.field('id', 'C', size=15)
+            w.field('name', 'C', size=30)
+            w.field('lat', 'N', decimal=3)
+            w.field('lon', 'N', decimal=3)
+            w.field('elev', 'N', decimal=1)
+
+            skipStations = ['999999-04728', '725186-99999', '725283-99999']
+
+            stationIds = []
+            for station in stations:
+                if station['STATE'] == 'NY':
+                    begin = datetime.strptime(station['BEGIN'], '%Y%m%d')
+                    end = datetime.strptime(station['END'], '%Y%m%d')
+
+                    if begin <= startTime and end >= endTime:
+                        stationId = '{USAF}-{WBAN}'.format(USAF=station['USAF'], WBAN=station['WBAN'])
+
+                        if stationId in skipStations:
+                            continue
+
+                        stationIds.append(stationId)
+
+                        lat = float(station['LAT'])
+                        lon = float(station['LON'])
+                        ele = float(station['ELEV(M)'])
+                        x, y = p(lon, lat)
+                        w.point(x, y, ele)
+                        w.record(stationId, station['STATION NAME'], lat, lon, ele)
+
+            w.save('./output/ny_asos')
+            return stationIds
+
+    def retrieve_observations(self, stations, years):
+        localLocation = './data/{Station}-{Year}'
+        ftpLocation = 'ftp://ftp.ncdc.noaa.gov/pub/data/noaa/isd-lite/{Year}/{Station}-{Year}.gz'
+
+        localZips = []
+        for station in stations:
+            for year in years:
+                localFile = localLocation.format(Station=station, Year=year)
+
+                if not path.exists(localFile) and not path.exists(localFile + '.gz'):
+                    self.logger.info('Downloading {File}'.format(File=localFile))
+                    localZips.append(localFile)
+                    remoteFile = urlopen(ftpLocation.format(Station=station, Year=year))
+
+                    with open(localFile + '.gz', 'wb') as localZipFile:
+                        localZipFile.write(remoteFile.read())
+
+        for localZip in glob('./data/*.gz'):
+            with gzip.open(localZip, 'rb') as zipFile:
+                with open(localZip[:-3], 'wb') as localFile:
+                    self.logger.info('Unzipping {File}'.format(File=localZip))
+                    for line in zipFile:
+                        localFile.write(line)
+
+            remove(localZip)
+
