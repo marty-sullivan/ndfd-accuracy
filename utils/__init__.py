@@ -225,10 +225,24 @@ class GoUtils:
             stationsJson.write(json.dumps(nyStations))
 
     def parse_ghcn_observations(self, ele, years, startTime, endTime):
-        yearHeaders = ['id', 'date', 'ele', 'val', 'time']
+        yearHeaders = ['id', 'date', 'ele', 'val', 'mflag', 'qflag', 'sflag', 'time']
 
         with open('./data/stations.json', 'r') as stationsJson:
             stations = json.load(stationsJson)
+
+        if path.exists('./data/obs.sqlite'):
+            remove('./data/obs.sqlite')
+
+        sqlconn = sqlite3.connect('./data/obs.sqlite')
+        c = sqlconn.cursor()
+        c.execute((
+            'CREATE TABLE observations ('
+                'stationId TEXT,'
+                'date INT,'
+                'prcp FLOAT,'
+                'PRIMARY KEY(stationId, date)'
+            ');'
+        ))
 
         for year in years:
             self.logger.info('Reading Year: ' + year)
@@ -239,6 +253,24 @@ class GoUtils:
 
                 for row in reader:
                     if row['ele'] == ele:
-                        obsTime = datetime.strptime(row['date'], '%Y%m%d')
-                        if obsTime >= startTime and obsTime <= endTime and row['id'] in stations:
-                            print row
+                        obsDate = datetime.strptime(row['date'], '%Y%m%d')
+                        if obsDate >= startTime and obsDate <= endTime and row['id'] in stations:
+                            try:
+                                if len(row['time']) > 0:
+                                    row['time'] = row['time'].replace('24', '00')
+                                    obsTime = datetime.strptime(row['date'] + row['time'], '%Y%m%d%H%M')
+                                else:
+                                    obsTime = obsDate
+
+                            except:
+                                self.logger.warning(row['date'] + row['time'])
+                                self.logger.warning('Problem with {Row}'.format(Row=row))
+                                obsTime = obsDate
+                                
+                            sql = 'INSERT INTO observations (stationId, date, prcp) VALUES ("{Station}", {Date}, {Prcp});'
+                            c.execute(sql.format(Station=row['id'], Date=obsTime.strftime('%s'), Prcp=float(row['val'])))
+                        
+
+        sqlconn.commit()
+        sqlconn.close()
+
