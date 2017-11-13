@@ -1,19 +1,23 @@
 import csv
 import gzip
-import json
 import logging
 import pandas
+import pygrib
 import shapefile
 import sqlite3
-import subprocess
 import yaml
 from boto3.session import Session
 from botocore.exceptions import ClientError, WaiterError
 from datetime import datetime, timedelta
+from ftplib import FTP
 from glob import glob
-from os import path, remove
-from pyproj import Proj
+from multiprocessing import cpu_count
+from numpy.ma.core import MaskedConstant as NAN
+from os import mkdir, path, remove
+from pyproj import Geod, Proj
+from Queue import Queue
 from sys import stdout
+from threading import Thread
 from urllib2 import urlopen
 
 class GoUtils:
@@ -28,6 +32,12 @@ class GoUtils:
         with open('config.yml', 'r') as frameworkYAML:
             self.config = yaml.load(frameworkYAML)
 
+        self.start = datetime.strptime(self.args.start, '%Y%m%d')
+        self.end = datetime.strptime(self.args.end, '%Y%m%d')
+        self.gribQ = Queue(maxsize=cpu_count())
+        self.yearQ = Queue(maxsize=cpu_count())
+        self.sqlQ = Queue()
+
     def init_aws(self):
         if self.args.profile:
             self.aws = Session(profile_name=self.args.profile, region_name=self.args.region)
@@ -39,13 +49,11 @@ class GoUtils:
         self.s3 = self.aws.resource('s3')
 
     def init_logging(self):
-        log_levels = { 'DEBUG': logging.DEBUG, 'INFO': logging.INFO, 'WARNING': logging.WARNING, 'ERROR': logging.ERROR, 'CRITICAL': logging.CRITICAL }
-
         self.logger = logging.getLogger()
-        self.logger.setLevel(log_levels[self.args.log_level])
+        self.logger.setLevel(logging.DEBUG if self.args.debug else logging.INFO)
 
         sh = logging.StreamHandler(stdout)
-        sh.setLevel(log_levels[self.args.log_level])
+        sh.setLevel(logging.DEBUG if self.args.debug else logging.INFO)
         formatter = logging.Formatter('[%(levelname)s] %(asctime)s %(message)s')
         sh.setFormatter(formatter)
         self.logger.addHandler(sh)
@@ -54,135 +62,91 @@ class GoUtils:
         logging.getLogger('boto3').propagate = False
         logging.getLogger('botocore').propagate = False
 
-    def parse_asos_stations(self, startTime, endTime):
-        with open('./isd-history.csv', 'rb') as csvHistory:
-            stations = csv.DictReader(csvHistory)
-
-            p = Proj('+proj=utm +zone=18T, +north +ellps=GRS80 +datum=NAD83 +units=m +no_defs')
-            w = shapefile.Writer(shapeType=shapefile.POINTZ)
+    def row_threader(self):
+        while True:
+            sqlconn = sqlite3.connect('./data/obs.sqlite')
+            c = sqlconn.cursor()
+            sql_rows = self.sqlQ.get()
+            for sql in sql_rows:
+                c.execute(sql)
+                sqlconn.commit()
+            sqlconn.close()
+            self.sqlQ.task_done()
             
-            w.field('id', 'C', size=15)
-            w.field('name', 'C', size=30)
-            w.field('lat', 'N', decimal=3)
-            w.field('lon', 'N', decimal=3)
-            w.field('elev', 'N', decimal=1)
+    def daterange(self):
+        for n in range(int ((self.end - self.start).days + 1)):
+            yield self.start + timedelta(n)
 
-            skipStations = ['999999-04728', '725186-99999', '725283-99999']
-
-            stationIds = []
-            for station in stations:
-                if station['STATE'] == 'NY':
-                    begin = datetime.strptime(station['BEGIN'], '%Y%m%d')
-                    end = datetime.strptime(station['END'], '%Y%m%d')
-
-                    if begin <= startTime and end >= endTime:
-                        stationId = '{USAF}-{WBAN}'.format(USAF=station['USAF'], WBAN=station['WBAN'])
-                        if stationId in skipStations:
-                            continue
-                        stationIds.append(stationId)
-
-                        lat = float(station['LAT'])
-                        lon = float(station['LON'])
-                        ele = float(station['ELEV(M)'])
-                        x, y = p(lon, lat)
-                        w.point(x, y, ele)
-                        w.record(stationId, station['STATION NAME'], lat, lon, ele)
-
-            w.save('./output/ny_asos')
-            return stationIds
-
-    def retrieve_asos_observations(self, stations, years):
-        localLocation = './data/{Station}-{Year}'
-        ftpLocation = 'ftp://ftp.ncdc.noaa.gov/pub/data/noaa/isd-lite/{Year}/{Station}-{Year}.gz'
-
-        localZips = []
-        for station in stations:
-            for year in years:
-                localFile = localLocation.format(Station=station, Year=year)
-
-                if not path.exists(localFile) and not path.exists(localFile + '.gz'):
-                    self.logger.info('Downloading {File}'.format(File=localFile))
-                    localZips.append(localFile)
-                    remoteFile = urlopen(ftpLocation.format(Station=station, Year=year))
-
-                    with open(localFile + '.gz', 'wb') as localZipFile:
-                        localZipFile.write(remoteFile.read())
-
-        for localZip in glob('./data/*.gz'):
-            with gzip.open(localZip, 'rb') as zipFile:
-                with open(localZip[:-3], 'wb') as localFile:
-                    self.logger.info('Unzipping {File}'.format(File=localZip))
-                    for line in zipFile:
-                        localFile.write(line)
-
-            remove(localZip)
-
-        if path.exists('./data/obs.sqlite'):
-            remove('./data/obs.sqlite')
-        sqlconn = sqlite3.connect('./data/obs.sqlite')
-        c = sqlconn.cursor()
-        c.execute((
-            'CREATE TABLE station_hours ('
-                'stationId TEXT,'
-                'date INT,'
-                'temp FLOAT,'
-                'qpf1 FLOAT,'
-                'qpf6 FLOAT,'
-                'PRIMARY KEY(stationId, date)'
-            ');'
-        ))
-
-        colspec = [(0, 4), (5, 7), (8, 10), (11, 14), (13, 20), (19, 25), (25, 32), (31, 38), (37, 44), (43, 50), (49, 56), (55, 62)]
-        headers = ['year', 'month', 'day', 'hour', 'temp', 'dpt', 'pres', 'wdir', 'wspd', 'skyc', 'qpf1', 'qpf6']
-        missing = '-9999'
-
-        for dataFile in glob('./data/*'):
-            stationId = dataFile[7:-5]
-            stationYear = pandas.read_fwf(dataFile, colspecs=colspec, names=headers)
-            for i, row in stationYear.iterrows():
-                return
-                hour = datetime.strptime(row['year'] + row['month'] + row['day'] + row['hour'], '%Y%m%d%H')
-                #c.execute(
-                #    'INSERT INTO station_hours (stationId, date, temp, qpf1, qpf6) VALUES ('
-                #        stationId
-                #        hour.strftime(
-                #    ');'
-                #)
-
-    def retrieve_ghcn_observations(self, years):
+    def retrieve_ghcn_observations(self):
         ftpYear = 'ftp://ftp.ncdc.noaa.gov/pub/data/ghcn/daily/by_year/{Year}.csv.gz'
         localYear = './data/{Year}.csv'
 
-        localZips = []
-        for year in years:
+        if not path.exists('./data'):
+            mkdir('./data')
+
+        for year in range(self.start.year, self.end.year + 1):
             localFile = localYear.format(Year=year)
+            remoteFile = urlopen(ftpYear.format(Year=year))
+            self.logger.info('Downloading {File}\a'.format(File=localFile))
+
+            with open(localFile + '.gz', 'wb') as localZipFile:
+                localZipFile.write(remoteFile.read())
             
-            if not path.exists(localFile) and not path.exists(localFile + '.gz'):
-                self.logger.info('Downloading {File}'.format(File=localFile))
-                localZips.append(localFile)
-                remoteFile = urlopen(ftpYear.format(Year=year))
+            with gzip.open(localFile + '.gz', 'rb') as localZipFile:
+                with open(localFile, 'wb') as localCsvFile:
+                    self.logger.debug('Unzipping {File}'.format(File=localFile))
+                    localCsvFile.write(localZipFile.read())
+            remove(localFile + '.gz')
 
-                with open(localFile + '.gz', 'wb') as localZipFile:
-                    localZipFile.write(remoteFile.read())
+    def retrieve_ndfd_forecasts(self):
+        ftpDomain = 'nomads.ncdc.noaa.gov'
+        httpPath = 'https://nomads.ncdc.noaa.gov/data/ndfd/{DayPath}/{File}'
+        localPath = './data/ndfd/{File}'
 
-        for localZip in glob('./data/*.gz'):
-            with gzip.open(localZip, 'rb') as zipFile:
-                with open(localZip[:-3], 'wb') as localFile:
-                    self.logger.debug('Unzipping {File}'.format(File=localZip))
-                    for line in zipFile:
-                        localFile.write(line)
+        if not path.exists('./data/ndfd'):
+            mkdir('./data/ndfd')
+    
+        ftp = FTP()
+        ftp.connect(ftpDomain)
+        ftp.login()
 
-            remove(localZip)
+        for day in self.daterange():
+            dayPath = day.strftime('/NDFD/%Y%m/%Y%m%d/')
+            self.logger.info('Enumerating Variables for {DayPath}'.format(DayPath=dayPath))
 
-    def parse_ghcn_stations(self, startTime, endTime):
+            try:
+                ftp.cwd(dayPath)
+            except:
+                self.logger.error('Problem with FTP DayPath: {DayPath}'.format(DayPath=dayPath))
+                continue
+
+            ls = []
+            ftp.retrlines('MLSD', ls.append)
+            for entry in ls:
+                f = entry.split(';')[-1].strip()
+                if self.args.retrieve_forecasts in f:
+                    dayPath = day.strftime('%Y%m/%Y%m%d')
+                    remoteHttp = httpPath.format(DayPath=dayPath, File=f)
+                    self.logger.info('Downloading {Http}'.format(Http=remoteHttp))
+
+                    try:                    
+                        remoteFile = urlopen(remoteHttp)
+                        with open(localPath.format(File=f), 'w') as localFile:
+                            localFile.write(remoteFile.read())
+
+                    except:
+                        self.logger.error('Problem with HTTP File: {Http}'.format(Http=remoteHttp))
+                        continue
+
+    def parse_ghcn_stations(self):
         stationFile = './data/ghcnd-stations.txt'
         inventoryFile = './data/ghcnd-inventory.txt'
         ftpStations = 'ftp://ftp.ncdc.noaa.gov/pub/data/ghcn/daily/ghcnd-stations.txt'
         ftpInventory = 'ftp://ftp.ncdc.noaa.gov/pub/data/ghcn/daily/ghcnd-inventory.txt'        
+        startYear = int(self.start.strftime('%Y'))
+        endYear = int(self.end.strftime('%Y'))
 
-        startYear = int(startTime.strftime('%Y'))
-        endYear = int(endTime.strftime('%Y'))
-
+        self.logger.info('Retrieving Latest GHCN Station Inventory')
         remoteFile = urlopen(ftpStations)
         with open(stationFile, 'w') as localFile:
             localFile.write(remoteFile.read())
@@ -199,62 +163,46 @@ class GoUtils:
         stations = pandas.read_fwf(stationFile, colspecs=stationSpec, names=stationHead)
         inventory = pandas.read_fwf(inventoryFile, colspecs=inventorySpec, names=inventoryHead)
 
-        p = Proj('+proj=utm +zone=18T, +north +ellps=GRS80 +datum=NAD83 +units=m +no_defs')
-
-        pointz = shapefile.Writer(shapeType=shapefile.POINTZ)
-        pointz.field('stationId', 'C', size=11)
-        pointz.field('name', 'C', size=30)
-        pointz.field('lat', 'N', decimal=4)
-        pointz.field('lon', 'N', decimal=4)
-        pointz.field('elev', 'N', decimal=1)
-        
-        nyStations = []
-        for i, row in stations.iterrows():
-            if row['st'] == 'NY':
-                inv = inventory.loc[(inventory['id'] == row['id']) & (inventory['ele'] == 'PRCP') & (inventory['start'] <= startYear) & (inventory['end'] >= endYear)]
-                if not inv.empty:
-                    nyStations.append(row['id'])
-                    x, y = p(row['lon'], row['lat'])
-                    pointz.point(x, y, row['elev'])
-                    pointz.record(row['id'], row['name'], row['lat'], row['lon'], row['elev'])
-
-        self.logger.info('{Count} valid stations in NYS.'.format(Count=len(nyStations)))
-        pointz.save('./output/ny_ghcn')
-
-        with open('./data/stations.json', 'w') as stationsJson:
-            stationsJson.write(json.dumps(nyStations))
-
-    def parse_ghcn_observations(self, ele, years, startTime, endTime):
-        yearHeaders = ['id', 'date', 'ele', 'val', 'mflag', 'qflag', 'sflag', 'time']
-
-        with open('./data/stations.json', 'r') as stationsJson:
-            stations = json.load(stationsJson)
-
-        if path.exists('./data/obs.sqlite'):
-            remove('./data/obs.sqlite')
-
         sqlconn = sqlite3.connect('./data/obs.sqlite')
         c = sqlconn.cursor()
         c.execute((
-            'CREATE TABLE observations ('
-                'stationId TEXT,'
-                'date INT,'
-                'prcp FLOAT,'
-                'PRIMARY KEY(stationId, date)'
+            'CREATE TABLE IF NOT EXISTS stations ('
+                'stationId TEXT PRIMARY KEY,'
+                'stationName TEXT,'
+                'lat FLOAT,'
+                'lon FLOAT,'
+                'elev FLOAT'
             ');'
         ))
 
-        for year in years:
-            self.logger.info('Reading Year: ' + year)
+        for i, row in stations.iterrows():
+            if row['st'] in self.args.states:
+                inv = inventory.loc[(inventory['id'] == row['id']) & (inventory['ele'] == 'PRCP') & (inventory['start'] <= startYear) & (inventory['end'] >= endYear)]
+                if not inv.empty:
+                    self.logger.info('Valid Station: {Name}'.format(Name=row['name']))
+                    sql = 'INSERT INTO stations (stationId, stationName, lat, lon, elev) VALUES ("{Station}", "{Name}", {Lat}, {Lon}, {Elev});'
+                    c.execute(sql.format(Station=row['id'], Name=row['name'], Lat=row['lat'], Lon=row['lon'], Elev=row['elev']))
+
+        sqlconn.commit()
+        sqlconn.close()
+
+    def year_parser(self):
+        while True:
+            year = self.yearQ.get()
+
+            self.logger.info('Reading Year: {Year}\a'.format(Year=year))
             yearFile = './data/{Year}.csv'.format(Year=year)
-            
+            yearHeaders = ['id', 'date', 'ele', 'val', 'mflag', 'qflag', 'sflag', 'time']
+            sql = 'INSERT INTO observations (stationId, date, element, val) VALUES ("{Station}", {Date}, "{Element}", {Val});'
+            sql_rows = []
+
             with open(yearFile, 'r') as yearCsv:
                 reader = csv.DictReader(yearCsv, fieldnames=yearHeaders)
 
                 for row in reader:
-                    if row['ele'] == ele:
+                    if row['ele'] in self.args.elements:
                         obsDate = datetime.strptime(row['date'], '%Y%m%d')
-                        if obsDate >= startTime and obsDate <= endTime and row['id'] in stations:
+                        if row['id'] in self.stations and obsDate >= self.start and obsDate <= self.end:
                             try:
                                 if len(row['time']) > 0:
                                     row['time'] = row['time'].replace('24', '00')
@@ -266,11 +214,124 @@ class GoUtils:
                                 self.logger.warning(row['date'] + row['time'])
                                 self.logger.warning('Problem with {Row}'.format(Row=row))
                                 obsTime = obsDate
-                                
-                            sql = 'INSERT INTO observations (stationId, date, prcp) VALUES ("{Station}", {Date}, {Prcp});'
-                            c.execute(sql.format(Station=row['id'], Date=obsTime.strftime('%s'), Prcp=float(row['val'])))
-                        
 
-        sqlconn.commit()
+                            sql_rows.append(sql.format(Station=row['id'], Date=obsTime.strftime('%s'), Element=row['ele'], Val=float(row['val'])))
+
+            self.sqlQ.put(sql_rows)
+            self.yearQ.task_done()
+
+    def parse_ghcn_observations(self):
+        sqlconn = sqlite3.connect('./data/obs.sqlite')
+        sqlconn.row_factory = lambda cursor, row: row[0]
+        c = sqlconn.cursor()
+        c.execute((
+            'CREATE TABLE IF NOT EXISTS observations ('
+                'stationId TEXT,'
+                'date INT,'
+                'element TEXT,'
+                'val FLOAT,'
+                'PRIMARY KEY (stationId, date, element),'
+                'FOREIGN KEY (stationId) REFERENCES stations(stationId)'
+            ');'
+        ))
+
+        self.stations = c.execute('SELECT stationId FROM stations').fetchall()
         sqlconn.close()
+
+        obsT = []
+        for i in range(cpu_count()):
+            t = Thread(target=self.year_parser)
+            t.daemon = True
+            t.start()
+            obsT.append(t)
+
+        self.logger.info('Parsing Observations for {Count} Stations'.format(Count=len(self.stations)))
+        for year in range(self.start.year, self.end.year + 1):
+             self.yearQ.put(year)
+
+        self.yearQ.join()
+
+        sqlT = Thread(target=self.row_threader)
+        sqlT.daemon = True
+        sqlT.start()
+
+        self.sqlQ.join()
+        self.logger.info('Observations Parsed!\a')
+
+    def get_nearest_point(self, grib, lat, lon):
+        p = Proj(grib.projparams)
+        offsetX, offsetY = p(grib['longitudeOfFirstGridPointInDegrees'], grib['latitudeOfFirstGridPointInDegrees'])
+        gridX, gridY = p(lon, lat)
+        x = int(round((gridX - offsetX) / grib['DxInMetres']))
+        y = int(round((gridY - offsetY) / grib['DyInMetres']))
+        return x, y
+
+    def grib_parser(self):
+        #sql = 'INSERT INTO observations (stationId, date, element, val) VALUES ("{Station}", {Date}, "{Element}", {Val});'
+        sql = 'INSERT INTO forecasts (stationId, date, var, val) VALUES ("{Station}", {Date}, "{Var}", {Val});'
+
+        while True:
+            gribPath = self.gribQ.get()
+            forecasts = []
+            with pygrib.open(gribPath) as gribs:
+                for grib in gribs:
+                    t = datetime(grib['year'], grib['month'], grib['day'], grib['hour'])
+
+                    if t.hour == 0:
+                        if grib['forecastTime'] == 36:
+                            d = (t + timedelta(hours=36)).replace(hour=0)
+                            self.logger.info('Parsing Stations for {Date}'.format(Date=d.strftime('%Y/%m/%d')))
+
+                            for station in self.stations:
+                                x, y = self.get_nearest_point(grib, station[1], station[2])
+                                val = grib.values[y][x]
+                                val = val if type(val) != NAN else float('nan')
+                                forecasts.append(sql.format(Station=station[0], Date=d.strftime('%s'), Var='YDUZ', Val=val))
+
+                        elif grib['forecastTime'] > 36:
+                            break
+
+                    else:
+                        break
+            
+            if len(forecasts) > 0:
+                self.sqlQ.put(forecasts)
+
+            self.gribQ.task_done()
+
+    def parse_ndfd_forecasts(self):
+        sqlconn = sqlite3.connect('./data/obs.sqlite')
+        sqlconn.row_factory = lambda cursor, row: [row[0], row[1], row[2]]
+        c = sqlconn.cursor()
+        c.execute((
+            'CREATE TABLE IF NOT EXISTS forecasts ('
+                'stationId TEXT,'
+                'date INT,'
+                'var TEXT,'
+                'val FLOAT,'
+                'PRIMARY KEY (stationId, date, var),'
+                'FOREIGN KEY (stationId) REFERENCES stations(stationId)'
+            ');'
+        ))
+
+        self.stations = c.execute('SELECT stationId, lat, lon FROM stations').fetchall()
+        sqlconn.close()
+
+        gribT = []
+        for i in range(cpu_count()):
+            t = Thread(target=self.grib_parser)
+            t.daemon = True
+            t.start()
+            gribT.append(t)
+
+        sqlT = Thread(target=self.row_threader)
+        sqlT.daemon = True
+        sqlT.start()
+
+        for grib in glob('./data/ndfd/*'):
+            self.gribQ.put(grib)
+
+        self.gribQ.join()
+        self.sqlQ.join()
+        self.logger.info('Forecasts Parsed!\a') 
 
