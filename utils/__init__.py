@@ -11,13 +11,11 @@ from botocore.exceptions import ClientError, WaiterError
 from datetime import datetime, timedelta
 from ftplib import FTP
 from glob import glob
-from multiprocessing import cpu_count
+from multiprocessing import cpu_count, Process, Queue
 from numpy.ma.core import MaskedConstant as NAN
 from os import mkdir, path, remove
 from pyproj import Geod, Proj
-from Queue import Queue
 from sys import stdout
-from threading import Thread
 from urllib2 import urlopen
 
 class GoUtils:
@@ -70,10 +68,14 @@ class GoUtils:
             c = sqlconn.cursor()
             sql_rows = self.sqlQ.get()
             for sql in sql_rows:
-                c.execute(sql)
-                sqlconn.commit()
+                try:
+                    c.execute(sql)
+                    sqlconn.commit()
+                
+                except:
+                    self.logger.error('Existing Row')
+
             sqlconn.close()
-            self.sqlQ.task_done()
 
             rowSetCount += 1
             rowCount += len(sql_rows)
@@ -227,7 +229,6 @@ class GoUtils:
                             sql_rows.append(sql.format(Station=row['id'], Date=obsTime.strftime('%s'), Element=row['ele'], Val=float(row['val'])))
 
             self.sqlQ.put(sql_rows)
-            self.yearQ.task_done()
 
     def parse_ghcn_observations(self):
         sqlconn = sqlite3.connect('./data/obs.sqlite')
@@ -280,6 +281,9 @@ class GoUtils:
 
         while True:
             gribPath = self.gribQ.get()
+            if gribPath == 'DONE':
+               break 
+
             forecasts = []
             with pygrib.open(gribPath) as gribs:
                 for grib in gribs:
@@ -306,8 +310,6 @@ class GoUtils:
             if len(forecasts) > 0:
                 self.sqlQ.put(forecasts)
 
-            self.gribQ.task_done()
-
     def parse_ndfd_forecasts(self):
         sqlconn = sqlite3.connect('./data/obs.sqlite')
         sqlconn.row_factory = lambda cursor, row: [row[0], row[1], row[2]]
@@ -326,21 +328,20 @@ class GoUtils:
         self.stations = c.execute('SELECT stationId, lat, lon FROM stations').fetchall()
         sqlconn.close()
 
-        gribT = []
+        gribP = []
         for i in range(cpu_count()):
-            t = Thread(target=self.grib_parser)
-            t.daemon = True
-            t.start()
-            gribT.append(t)
+            p = Process(target=self.grib_parser)
+            p.start()
+            gribP.append(p)
 
-        sqlT = Thread(target=self.row_threader)
-        sqlT.daemon = True
-        sqlT.start()
+        sqlP = Process(target=self.row_threader)
+        sqlP.start()
 
         for grib in glob('./data/ndfd/*'):
             self.gribQ.put(grib)
 
-        self.gribQ.join()
-        self.sqlQ.join()
+        for i in range(cpu_count()):
+            self.gribQ.put('DONE')
+
         self.logger.info('Forecasts Parsed!\a') 
 
