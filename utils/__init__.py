@@ -345,3 +345,98 @@ class GoUtils:
 
         self.logger.info('Forecasts Parsed!\a') 
 
+    def analyze_accuracy(self):
+        sql = 'SELECT COUNT(*) FROM forecasts JOIN observations ON observations.stationId=forecasts.stationId and forecasts.date=observations.date WHERE forecasts.stationId="{Station}" AND observations.element="PRCP" AND forecasts.val{ForecastOp} AND observations.val{ObservationOp};'
+        sqlconn = sqlite3.connect('./data/obs.sqlite')
+        c = sqlconn.cursor()
+        stations = c.execute('SELECT * FROM stations').fetchall()
+
+        c.execute((
+            'CREATE TABLE IF NOT EXISTS accuracy ('
+                'stationId TEXT PRIMARY KEY,'
+                'good FLOAT,'
+                'bad FLOAT,'
+                'total FLOAT,'
+                'accuracy FLOAT,'
+                'FOREIGN KEY (stationId) REFERENCES stations(stationId)'
+            ');'
+        ))
+
+        noMatch = 0
+        for station in stations:
+            rainPredicted =      float(c.execute(sql.format(Station=station[0], ForecastOp='>=50', ObservationOp='>=3')).fetchall()[0][0])
+            noRainPredicted =    float(c.execute(sql.format(Station=station[0], ForecastOp='<=50', ObservationOp='<3')).fetchall()[0][0])
+            rainNotPredicted =   float(c.execute(sql.format(Station=station[0], ForecastOp='<=50', ObservationOp='>=3')).fetchall()[0][0])
+            noRainNotPredicted = float(c.execute(sql.format(Station=station[0], ForecastOp='>=50', ObservationOp='<3')).fetchall()[0][0])
+
+            goodPrediction = rainPredicted + noRainPredicted
+            badPrediction = rainNotPredicted + noRainNotPredicted
+            totalDays = rainPredicted + noRainPredicted + rainNotPredicted + noRainNotPredicted
+
+            if totalDays < 365:
+                self.logger.debug('Not Enough Forecast-Observation Matches for {Station}'.format(Station=station[0]))
+                accuracy = -1
+
+            elif goodPrediction == 0:
+                self.logger.debug('No Good Predictions for {Station}'.format(Station=station[0]))
+                accuracy = -1
+              
+            else:  
+                accuracy = round(goodPrediction / totalDays * 100, 1)
+
+            self.logger.debug('{Station} Accuracy: {Accuracy}%'.format(Station=station[0], Accuracy=accuracy))
+            c.execute('INSERT INTO accuracy (stationId, good, bad, total, accuracy) VALUES ("{Station}", {Good}, {Bad}, {Total}, {Accuracy});'.format(Station=station[0], Good=goodPrediction, Bad=badPrediction, Total=totalDays, Accuracy=accuracy))
+                
+
+
+        sqlconn.commit()
+        sqlconn.close()
+
+        self.logger.info('Analysis Done!')
+
+    def init_shapefile(self):
+        s = shapefile.Writer(shapeType=shapefile.POINTZ)
+        s.field('id', 'C', size=15)
+        s.field('name', 'C', size=30)
+        s.field('lat', 'N', decimal=3)
+        s.field('lon', 'N', decimal=3)
+        s.field('elev', 'N', decimal=1)
+        s.field('good', 'N', decimal=0)
+        s.field('bad', 'N', decimal=0)
+        s.field('total', 'N', decimal=0)
+        s.field('accuracy', 'N', decimal=1)
+        return s
+
+    def create_accuracy_shapefiles(self):
+        sqlconn = sqlite3.connect('./data/obs.sqlite')
+        c = sqlconn.cursor()
+        stations = c.execute('SELECT * FROM stations JOIN accuracy ON stations.stationId=accuracy.stationId').fetchall()
+
+        p = Proj('+proj=utm +zone=18T, +north +ellps=GRS80 +datum=NAD83 +units=m +no_defs')
+        accuracy = self.init_shapefile()
+        missing = self.init_shapefile()
+        allStations = self.init_shapefile()
+
+        for station in stations:
+            lat = station[2]
+            lon = station[3]
+            x, y = p(lon, lat)
+
+            if station[9] != -1:
+                accuracy.point(x, y, station[4])
+                accuracy.record(station[0], station[1], lat, lon, station[4], station[6], station[7], station[8], station[9])
+
+            else:
+                missing.point(x, y, station[4])
+                missing.record(station[0], station[1], lat, lon, station[4], station[6], station[7], station[8], station[9])
+                
+            allStations.point(x, y, station[4])
+            allStations.record(station[0], station[1], lat, lon, station[4], station[6], station[7], station[8], station[9])
+            
+
+        if not path.exists('./data/shapefiles'):
+            mkdir('./data/shapefiles')
+
+        accuracy.save('./data/shapefiles/ny_accuracy')
+        missing.save('./data/shapefiles/ny_missing')
+        allStations.save('./data/shapefiles/ny_all')

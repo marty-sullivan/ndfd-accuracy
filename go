@@ -18,6 +18,8 @@ parser.add_argument('--retrieve-forecasts', type=str, help='Retrieve NDFD foreca
 parser.add_argument('--parse-stations', action='store_true', help='Parse valid GHCN stations in states')
 parser.add_argument('--parse-observations', action='store_true', help='Parse observations for elements') 
 parser.add_argument('--parse-forecasts', action='store_true', help='Parse forecasts for stations')
+parser.add_argument('--analyze', action='store_true', help='Analyze NDFD Forecast Accuracy')
+parser.add_argument('--create-shapefiles', action='store_true', help='Create accuracy shapefiles')
 
 parser.add_argument('--profile', type=str, default=None, help='The AWS account profile to use. Only needed if not on an EC2 instance in the desired account with the proper Instance Profile')
 parser.add_argument('--region', type=str, default='us-east-1', help='The AWS region to use. Default: us-east-1')
@@ -51,3 +53,9 @@ if args.parse_observations:
 
 if args.parse_forecasts:
     utils.parse_ndfd_forecasts()
+
+if args.analyze:
+    utils.analyze_accuracy()
+
+if args.create_shapefiles:
+    utils.create_accuracy_shapefiles()
