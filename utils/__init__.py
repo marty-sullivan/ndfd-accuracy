@@ -77,8 +77,8 @@ class GoUtils:
 
             rowSetCount += 1
             rowCount += len(sql_rows)
-            self.logger.info('{Count} Total Row Sets Processed'.format(Count=rowSetCount)
-            self.logger.info('{Count} Total Rows Processed'.format(Count=rowCount)
+            self.logger.info('{Count} Total Row Sets Processed'.format(Count=rowSetCount))
+            self.logger.info('{Count} Total Rows Processed'.format(Count=rowCount))
             
     def daterange(self):
         for n in range(int ((self.end - self.start).days + 1)):
@@ -276,7 +276,6 @@ class GoUtils:
         return x, y
 
     def grib_parser(self):
-        #sql = 'INSERT INTO observations (stationId, date, element, val) VALUES ("{Station}", {Date}, "{Element}", {Val});'
         sql = 'INSERT INTO forecasts (stationId, date, var, val) VALUES ("{Station}", {Date}, "{Var}", {Val});'
 
         while True:
@@ -301,6 +300,7 @@ class GoUtils:
                             break
 
                     else:
+                        self.logger.warning('Skipping Stations for {File}'.format(File=path.basename(gribPath)))
                         break
             
             if len(forecasts) > 0:
