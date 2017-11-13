@@ -63,6 +63,8 @@ class GoUtils:
         logging.getLogger('botocore').propagate = False
 
     def row_threader(self):
+        rowSetCount = 0
+        rowCount = 0
         while True:
             sqlconn = sqlite3.connect('./data/obs.sqlite')
             c = sqlconn.cursor()
@@ -72,6 +74,11 @@ class GoUtils:
                 sqlconn.commit()
             sqlconn.close()
             self.sqlQ.task_done()
+
+            rowSetCount += 1
+            rowCount += len(sql_rows)
+            self.logger.info('{Count} Total Row Sets Processed'.format(Count=rowSetCount)
+            self.logger.info('{Count} Total Rows Processed'.format(Count=rowCount)
             
     def daterange(self):
         for n in range(int ((self.end - self.start).days + 1)):
@@ -137,6 +144,8 @@ class GoUtils:
                     except:
                         self.logger.error('Problem with HTTP File: {Http}'.format(Http=remoteHttp))
                         continue
+
+        self.logger.info('NDFD Data Retrieved!')
 
     def parse_ghcn_stations(self):
         stationFile = './data/ghcnd-stations.txt'
