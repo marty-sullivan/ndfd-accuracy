@@ -338,7 +338,6 @@ class GoUtils:
             p = Process(target=self.grib_parser)
             p.start()
             gribP.append(p)
-            break
 
         sqlP = Process(target=self.row_threader)
         sqlP.start()
