@@ -29,13 +29,6 @@ args = parser.parse_args()
 utils = GoUtils(args)
 
 
-
-
-
-
-
-
-
 startTime = datetime.strptime(args.start, '%Y%m%d')
 endTime = datetime.strptime(args.end, '%Y%m%d')
 

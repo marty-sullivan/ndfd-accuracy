@@ -1,5 +1,6 @@
 import csv
 import gzip
+import json
 import logging
 import pandas
 import pygrib
@@ -284,31 +285,35 @@ class GoUtils:
             if gribPath == 'DONE':
                break 
 
-            forecasts = []
+            forecasts = { }
             with pygrib.open(gribPath) as gribs:
                 for grib in gribs:
                     t = datetime(grib['year'], grib['month'], grib['day'], grib['hour'])
-
-                    if t.hour == 0:
-                        if grib['forecastTime'] == 36:
-                            d = (t + timedelta(hours=36)).replace(hour=0)
-                            self.logger.info('Parsing Stations for {Date}'.format(Date=d.strftime('%Y/%m/%d')))
-
-                            for station in self.stations:
-                                x, y = self.get_nearest_point(grib, station[1], station[2])
-                                val = grib.values[y][x]
-                                val = val if type(val) != NAN else float('nan')
-                                forecasts.append(sql.format(Station=station[0], Date=d.strftime('%s'), Var='YDUZ', Val=val))
-
-                        elif grib['forecastTime'] > 36:
-                            break
-
-                    else:
-                        self.logger.warning('Skipping Stations for {File}'.format(File=path.basename(gribPath)))
+                    
+                    if grib['forecastTime'] > 48:
                         break
-            
-            if len(forecasts) > 0:
-                self.sqlQ.put(forecasts)
+
+                    elif 30 <= grib['forecastTime'] <= 48:
+                        d = (t + timedelta(hours=grib['forecastTime']))
+                        self.logger.info('Parsing Stations for {Date}'.format(Date=d.strftime('%Y/%m/%d/%H')))
+
+                        for station in self.stations:
+                            stationName = station[0]
+
+                            x, y = self.get_nearest_point(grib, station[1], station[2])
+                            val = grib.values[y][x]
+                            val = val if type(val) != NAN else float('nan')
+                            if val == float('nan'): continue
+                            stationForecast = forecasts[stationName] if stationName in forecasts else { 'total': 0, 'date': d.replace(hour=0).strftime('%Y%m%d') }
+                            stationForecast['total'] += val
+                            forecasts[stationName] = stationForecast
+
+            forecastQueries = []
+            for stationName, station in forecasts.iteritems():
+                forecastQueries.append(sql.format(Station=stationName, Date=station['date'], Var='YIUZ', Val=station['total']))
+
+            if len(forecastQueries) > 0:
+                self.sqlQ.put(forecastQueries)
 
     def parse_ndfd_forecasts(self):
         sqlconn = sqlite3.connect('./data/obs.sqlite')
@@ -333,12 +338,27 @@ class GoUtils:
             p = Process(target=self.grib_parser)
             p.start()
             gribP.append(p)
+            break
 
         sqlP = Process(target=self.row_threader)
         sqlP.start()
 
-        for grib in glob('./data/ndfd/*'):
-            self.gribQ.put(grib)
+        for day in self.daterange():
+            gribDates = []
+
+            for grib in glob(day.strftime('./data/ndfd/YIUZ98_KWBN_%Y%m%d*')):
+                gribDates.append(datetime.strptime(grib, './data/ndfd/YIUZ98_KWBN_%Y%m%d%H%M'))
+
+            if len(gribDates) > 0:
+                bestGrib = min(gribDates, key=lambda d: abs(d - day))
+                grib = bestGrib.strftime('./data/ndfd/YIUZ98_KWBN_%Y%m%d%H%M')
+                self.gribQ.put(grib)
+                self.logger.info('Using {Grib} for {Date}'.format(Grib=grib, Date=day.strftime('%Y/%m/%d')))
+            
+            else:
+                self.logger.info('No Gribs for {Date}'.format(Date=day))
+            
+        
 
         for i in range(cpu_count()):
             self.gribQ.put('DONE')
