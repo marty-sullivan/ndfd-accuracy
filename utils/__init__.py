@@ -12,7 +12,7 @@ from botocore.exceptions import ClientError, WaiterError
 from datetime import datetime, timedelta
 from ftplib import FTP
 from glob import glob
-from multiprocessing import cpu_count, Process, Queue
+from multiprocessing import cpu_count, Process, JoinableQueue as Queue
 from numpy.ma.core import MaskedConstant as NAN
 from os import mkdir, path, remove
 from pyproj import Geod, Proj
@@ -33,8 +33,8 @@ class GoUtils:
 
         self.start = datetime.strptime(self.args.start, '%Y%m%d')
         self.end = datetime.strptime(self.args.end, '%Y%m%d')
-        self.gribQ = Queue(maxsize=cpu_count())
-        self.yearQ = Queue(maxsize=cpu_count())
+        self.gribQ = Queue()
+        self.yearQ = Queue()
         self.sqlQ = Queue()
 
     def init_aws(self):
@@ -80,8 +80,10 @@ class GoUtils:
 
             rowSetCount += 1
             rowCount += len(sql_rows)
-            self.logger.info('{Count} Total Row Sets Processed'.format(Count=rowSetCount))
-            self.logger.info('{Count} Total Rows Processed'.format(Count=rowCount))
+            self.logger.debug('{Count} Total Row Sets Processed'.format(Count=rowSetCount))
+            self.logger.debug('{Count} Total Rows Processed'.format(Count=rowCount))
+
+            self.sqlQ.task_done()
             
     def daterange(self):
         for n in range(int ((self.end - self.start).days + 1)):
@@ -282,20 +284,16 @@ class GoUtils:
 
         while True:
             gribPath = self.gribQ.get()
-            if gribPath == 'DONE':
-               break 
+            self.logger.info('Parsing Stations for {Date}'.format(Date=datetime.strptime(gribPath, './data/ndfd/YIUZ98_KWBN_%Y%m%d%H%M').replace(hour=0, minute=0)))
 
             forecasts = { }
             with pygrib.open(gribPath) as gribs:
                 for grib in gribs:
-                    t = datetime(grib['year'], grib['month'], grib['day'], grib['hour'])
-                    
-                    if grib['forecastTime'] > 48:
-                        break
-
-                    elif 30 <= grib['forecastTime'] <= 48:
+                    t = datetime(grib['year'], grib['month'], grib['day'])
+                    timeMultiplyer = 60 if grib['forecastTime'] > 72 else 1
+                
+                    if 30 * timeMultiplyer <= grib['forecastTime'] <= 48 * timeMultiplyer:
                         d = (t + timedelta(hours=grib['forecastTime']))
-                        self.logger.info('Parsing Stations for {Date}'.format(Date=d.strftime('%Y/%m/%d/%H')))
 
                         for station in self.stations:
                             stationName = station[0]
@@ -304,7 +302,7 @@ class GoUtils:
                             val = grib.values[y][x]
                             val = val if type(val) != NAN else float('nan')
                             if val == float('nan'): continue
-                            stationForecast = forecasts[stationName] if stationName in forecasts else { 'total': 0, 'date': d.replace(hour=0).strftime('%Y%m%d') }
+                            stationForecast = forecasts[stationName] if stationName in forecasts else { 'total': 0, 'date': (t + timedelta(hours=24)).strftime('%Y%m%d') }
                             stationForecast['total'] += val
                             forecasts[stationName] = stationForecast
 
@@ -314,6 +312,8 @@ class GoUtils:
 
             if len(forecastQueries) > 0:
                 self.sqlQ.put(forecastQueries)
+
+            self.gribQ.task_done()
 
     def parse_ndfd_forecasts(self):
         sqlconn = sqlite3.connect('./data/obs.sqlite')
@@ -333,15 +333,6 @@ class GoUtils:
         self.stations = c.execute('SELECT stationId, lat, lon FROM stations').fetchall()
         sqlconn.close()
 
-        gribP = []
-        for i in range(cpu_count()):
-            p = Process(target=self.grib_parser)
-            p.start()
-            gribP.append(p)
-
-        sqlP = Process(target=self.row_threader)
-        sqlP.start()
-
         for day in self.daterange():
             gribDates = []
 
@@ -351,16 +342,25 @@ class GoUtils:
             if len(gribDates) > 0:
                 bestGrib = min(gribDates, key=lambda d: abs(d - day))
                 grib = bestGrib.strftime('./data/ndfd/YIUZ98_KWBN_%Y%m%d%H%M')
+                self.logger.info('Using {Grib} for {Date}'.format(Grib=path.basename(grib), Date=day))
                 self.gribQ.put(grib)
-                self.logger.info('Using {Grib} for {Date}'.format(Grib=grib, Date=day.strftime('%Y/%m/%d')))
             
             else:
-                self.logger.info('No Gribs for {Date}'.format(Date=day))
-            
-        
+                self.logger.warning('No Gribs for {Date}'.format(Date=day))
 
+        sqlP = Process(target=self.row_threader)
+        sqlP.daemon = True
+        sqlP.start()
+
+        gribP = []
         for i in range(cpu_count()):
-            self.gribQ.put('DONE')
+            p = Process(target=self.grib_parser)
+            p.daemon = True
+            p.start()
+            gribP.append(p)
+
+        self.gribQ.join()
+        self.sqlQ.join()
 
         self.logger.info('Forecasts Parsed!\a') 
 
